@@ -1,8 +1,12 @@
 # FireRedASR-vLLM-ez
 An easy implementation of vLLM based on the FireRedASR project
 
+## 介绍
+目前lm支持的ASR模型只有Wisper, 但是Whisper的中文推理效果不是很好，其他优秀的中文开源ASR模型基本都不支持vllm部署。
+本项目参考[@GeeeekExplorer]https://github.com/GeeeekExplorer/nano-vllm 大佬的nano-vllm项目，利用flash-attn2简单实现了vllm的kvcache算法。
+由于ASR任务通常都是短序列输入，本项目没有实现pageattention, 统一根据解码最大长度预分配缓存空间。
 
-#快速开始
+## 快速开始
 
 ### 1. 克隆仓库
 ```bash
@@ -24,3 +28,19 @@ source venv/bin/activate
 ```bash
 pip install -r requirements.txt
 ```
+### 4.在线推理api(测试推理速度)
+```bash
+# 使用默认端口启动
+python main.py --model-path /path/to/your/model
+
+# 指定端口启动
+python main.py -m /path/to/your/model -p 8080
+
+# 指定主机和端口
+python main.py -m /path/to/your/model -H 127.0.0.1 -p 8000
+
+# 请求样例
+   curl -X POST "http://localhost:8000/asr/single" \
+   -F "audio_file=@/path/to/your/audio.wav"
+```
+
