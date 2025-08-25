@@ -10,8 +10,15 @@ from typing import List, Dict, Any, Optional
 from fireredasr.models.fireredasr import FireRedAsr
 import tempfile
 
-# 模型路径配置
-model_path = "your_model_path"
+# 解析命令行参数
+parser = argparse.ArgumentParser(description='FireRedASR API服务')
+parser.add_argument('--model-path', '-m', required=True, help='模型文件路径')
+parser.add_argument('--port', '-p', type=int, default=8025, help='服务端口，默认8025')
+parser.add_argument('--host', '-H', default='0.0.0.0', help='服务主机地址，默认0.0.0.0')
+args = parser.parse_args()
+
+# 模型路径配置（从命令行参数获取）
+model_path = args.model_path
 
 # 验证路径是否存在
 if not os.path.exists(model_path):
@@ -46,7 +53,7 @@ app = FastAPI(title="FireRedASR API", description="基于FireRedASR的语音识�
 # 加载模型
 def load_model():
     global model
-    print("正在加载模型...")
+    print(f"正在从 {model_path} 加载模型...")
     try:
         with model_lock:
             model = FireRedAsr.from_pretrained("aed", model_path)
@@ -201,13 +208,13 @@ if __name__ == '__main__':
     # 先加载模型
     load_model()
     
-    # 启动服务
+    # 启动服务（使用命令行参数中的端口和主机）
     import uvicorn
-    print("启动API服务...")
+    print(f"启动API服务，地址: {args.host}:{args.port}")
     uvicorn.run(
         app,
-        host='0.0.0.0',
-        port=8025,
+        host=args.host,
+        port=args.port,
         workers=1,  # 单进程，通过线程锁保证并发安全
         reload=False,
         timeout_keep_alive=120
