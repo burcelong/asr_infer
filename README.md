@@ -4,7 +4,15 @@ An easy implementation of vLLM based on the FireRedASR project
 ## 介绍
 目前lm支持的ASR模型只有Wisper, 但是Whisper的中文推理效果不是很好，其他优秀的中文开源ASR模型基本都不支持vllm部署。
 本项目参考[@GeeeekExplorer]https://github.com/GeeeekExplorer/nano-vllm 大佬的nano-vllm项目，利用flash-attn2简单实现了vllm的kvcache算法。
-由于ASR任务通常都是短序列输入，本项目没有实现pageattention, 统一根据解码最大长度预分配缓存空间。
+由于ASR任务通常都是短序列输入，本项目没有实现pageattention, 统一根据解码最大长度预分配缓存空间。用FireRedAsr官方测试推理速度结果如下：
+| 测试版本 | 音频时长 | 平均响应时间（秒） | 提升百分比  |
+|----------|----------|--------------------|-------------|
+| 提速版   | 4s       | 0.1467             | 25.04%      |
+| 原版     | 4s       | 0.1957             | -           |
+| 提速版   | 12s      | 0.5386             | 30.68%      |
+| 原版     | 12s      | 0.7770             | -           |
+
+
 
 ## 快速开始
 
@@ -43,4 +51,4 @@ python main.py -m /path/to/your/model -H 127.0.0.1 -p 8000
    curl -X POST "http://localhost:8000/asr/single" \
    -F "audio_file=@/path/to/your/audio.wav"
 ```
-
+### 5.测试结果
