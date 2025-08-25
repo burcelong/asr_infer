@@ -28,8 +28,26 @@ class FireRedAsrAed(torch.nn.Module):
                    beam_size=1, nbest=1, decode_max_len=0,
                    softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0):
         enc_outputs, _, enc_mask = self.encoder(padded_input, input_lengths)
-        nbest_hyps = self.decoder.batch_beam_search(
-            enc_outputs, enc_mask,
-            beam_size, nbest, decode_max_len,
-            softmax_smoothing, length_penalty, eos_penalty)
+        with torch.inference_mode():
+            nbest_hyps = self.decoder.batch_beam_search(
+                enc_outputs, enc_mask,
+                beam_size, nbest, decode_max_len,
+                softmax_smoothing, length_penalty, eos_penalty)
+       #print( nbest_hyps)
+        return nbest_hyps
+    
+    def encoding(self, padded_input, input_lengths):
+        """仅执行编码器部分，返回中间特征"""
+        enc_outputs, _, enc_mask = self.encoder(padded_input, input_lengths)
+        return enc_outputs, enc_mask, input_lengths  # 返回解码器需要的特征
+
+    def decoding(self, enc_outputs, enc_mask,
+                   beam_size=1, nbest=1, decode_max_len=0,
+                   softmax_smoothing=1.0, length_penalty=0.0, eos_penalty=1.0):
+        with torch.inference_mode():
+            nbest_hyps = self.decoder.batch_beam_search(
+                enc_outputs, enc_mask,
+                beam_size, nbest, decode_max_len,
+                softmax_smoothing, length_penalty, eos_penalty)
+       #print( nbest_hyps)
         return nbest_hyps

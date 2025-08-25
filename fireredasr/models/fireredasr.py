@@ -12,7 +12,7 @@ from fireredasr.tokenizer.llm_tokenizer import LlmTokenizerWrapper
 
 class FireRedAsr:
     @classmethod
-    def from_pretrained(cls, asr_type, model_dir):
+    def from_pretrained(cls, asr_type, model_dir,device=None):
         assert asr_type in ["aed", "llm"]
 
         cmvn_path = os.path.join(model_dir, "cmvn.ark")
@@ -30,6 +30,8 @@ class FireRedAsr:
             llm_dir = os.path.join(model_dir, "Qwen2-7B-Instruct")
             model, tokenizer = load_firered_llm_model_and_tokenizer(
                 model_path, encoder_path, llm_dir)
+        if device is not None:
+          model = model.to(device)
         model.eval()
         return cls(asr_type, feat_extractor, model, tokenizer)
 
@@ -66,12 +68,20 @@ class FireRedAsr:
             rtf= elapsed / total_dur if total_dur > 0 else 0
 
             results = []
-            for uttid, wav, hyp in zip(batch_uttid, batch_wav_path, hyps):
-                hyp = hyp[0]  # only return 1-best
-                hyp_ids = [int(id) for id in hyp["yseq"].cpu()]
-                text = self.tokenizer.detokenize(hyp_ids)
-                results.append({"uttid": uttid, "text": text, "wav": wav,
-                    "rtf": f"{rtf:.4f}"})
+            for uttid, wav, hyps_per_sample in zip(batch_uttid, batch_wav_path, hyps):
+            # 遍历当前样本的所有候选（共nbest个）
+                sample_results = []
+                for hyp in hyps_per_sample:  # 原代码中用hyp接收了hyps_per_sample，现在直接遍历它
+                    hyp_ids = [int(id) for id in hyp["yseq"].cpu()]  # 转换token ID为整数列表
+                    text = self.tokenizer.detokenize(hyp_ids)  # 解码为文本
+                    sample_results.append({
+                        "uttid": uttid,
+                        "text": text,
+                        "score": hyp["score"],  # 从hyp中提取得分
+                        "wav": wav,
+                        "rtf": f"{rtf:.4f}"  # 所有候选共享同一个实时率（因为处理时间相同）
+                    })
+                results.append(sample_results)  # 每个样本的结果是一个包含nbest个候选的列表
             return results
 
         elif self.asr_type == "llm":
