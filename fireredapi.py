@@ -11,7 +11,7 @@ from fireredasr.models.fireredasr import FireRedAsr
 import tempfile
 
 # 模型路径配置
-model_path = "Your model path"
+model_path = "your_model_path"
 
 # 验证路径是否存在
 if not os.path.exists(model_path):
@@ -207,7 +207,7 @@ if __name__ == '__main__':
     uvicorn.run(
         app,
         host='0.0.0.0',
-        port=8000,
+        port=8025,
         workers=1,  # 单进程，通过线程锁保证并发安全
         reload=False,
         timeout_keep_alive=120

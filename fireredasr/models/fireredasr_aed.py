@@ -1,7 +1,7 @@
 import torch
 
 from fireredasr.models.module.conformer_encoder import ConformerEncoder
-from fireredasr.models.module.transformer_decoder import TransformerDecoder
+from fireredasr.models.module.varlen_decoder import TransformerDecoder
 
 
 class FireRedAsrAed(torch.nn.Module):

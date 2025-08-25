@@ -7,8 +7,6 @@ from flash_attn import flash_attn_with_kvcache, flash_attn_varlen_func
 
 
 class TransformerDecoder(nn.Module):
-    """适用于ASR波束搜索的Transformer解码器，修复cu_seqlens_k形状匹配问题"""
-
     def __init__(
         self,
         sos_id: int,
@@ -43,10 +41,6 @@ class TransformerDecoder(nn.Module):
         self.layer_norm_out = nn.LayerNorm(d_model)
         self.tgt_word_prj.weight = self.tgt_word_emb.weight
         self.scale = (d_model ** 0.5)
-
-    def half(self):
-        super().half()
-        return self
 
     @torch.inference_mode()
     def batch_beam_search(
