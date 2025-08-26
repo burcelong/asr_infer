@@ -39,13 +39,10 @@ pip install -r requirements.txt
 ### 4.在线推理api(测试推理速度)
 ```bash
 # 使用默认端口启动
-python main.py --model-path /path/to/your/model
+python fireredapi.py --model-path /path/to/your/model
 
 # 指定端口启动
-python main.py -m /path/to/your/model -p 8080
-
-# 指定主机和端口
-python main.py -m /path/to/your/model -H 127.0.0.1 -p 8000
+python fireredapi.py  -m /path/to/your/model -p 8080
 
 # 请求样例
    curl -X POST "http://localhost:8000/asr/single" \
