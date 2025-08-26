@@ -1,12 +1,12 @@
 import torch
-import argparse
+import argparse  # 用于命令行参数解析
 import os
 import traceback
 import threading
 import time
 import asyncio
 import gc
-import wave  # 用于计算语音时长
+import wave
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -16,9 +16,39 @@ import tempfile
 import uuid
 from dataclasses import dataclass, field
 
-# ========================= 配置 =========================
-MODEL_PATH = os.getenv("FIRERED_MODEL_PATH", "/root/autodl-tmp/tenxun/FireRedASR-AED-L")
+# ========================= 命令行参数解析（核心新增） =========================
+def parse_args():
+    """解析命令行参数：支持指定模型路径和服务端口"""
+    parser = argparse.ArgumentParser(description="单队列ASR服务 - 支持命令行配置模型路径和端口")
+    # 模型路径参数：--model-path 或 -m，优先级：命令行 > 环境变量 > 默认值
+    parser.add_argument(
+        "--model-path", "-m",
+        type=str,
+        default=os.getenv("FIRERED_MODEL_PATH"),
+    )
+    # 服务端口参数：--port 或 -p，默认8023
+    parser.add_argument(
+        "--port", "-p",
+        type=int,
+        default=8023,
+    )
+    # 可选：添加主机参数（默认0.0.0.0，方便外部访问）
+    parser.add_argument(
+        "--host", "-H",
+        type=str,
+        default="0.0.0.0",
+        help="服务监听主机（默认：0.0.0.0，允许外部网络访问）"
+    )
+    return parser.parse_args()
 
+# 解析命令行参数（全局生效）
+args = parse_args()
+
+# ========================= 配置（基于命令行参数更新） =========================
+# 模型路径：命令行参数 > 环境变量 > 默认值（已在argparse中处理）
+MODEL_PATH = args.model_path
+
+# 验证模型路径有效性
 if not os.path.exists(MODEL_PATH):
     print(f"错误: 模型路径不存在 - {MODEL_PATH}")
     exit(1)
@@ -46,10 +76,7 @@ class BatchRequest:
 
 @dataclass
 class ModelInstance:
-    """
-    单模型实例类：
-    所有语音请求统一进入该实例的队列，条件变量驱动批处理
-    """
+    """单模型实例类：所有语音请求统一进入该实例的队列"""
     instance_id: int
     name: str  # 队列名称（用于日志区分）
     model: Any = None
@@ -83,13 +110,13 @@ class ASRRequest(BaseModel):
     use_gpu: int = 1  # 0=CPU，1=GPU
 
 
-# 全局唯一模型实例（替代原长短两个实例）
+# 全局唯一模型实例
 asr_instance: Optional[ModelInstance] = None
 
-# 创建FastAPI应用（更新描述为单队列服务）
+# 创建FastAPI应用
 app = FastAPI(
-    title="单队列ASR服务",
-    description="所有语音请求统一进入单个队列，由单个模型实例批处理"
+    title="单队列ASR服务（命令行配置版）",
+    description=f"支持命令行指定模型路径和端口，所有语音请求统一批处理\n当前模型路径：{MODEL_PATH}\n服务端口：{args.port}"
 )
 
 
@@ -116,16 +143,11 @@ def safe_results_index(results, i):
 
 
 def run_inference_with_oom_recovery(instance: ModelInstance, batch_uttid, batch_wav_path, config, take_count):
-    """
-    推理执行（带OOM恢复逻辑）：
-    - 首次按当前批次量推
-    - 若OOM则清空缓存并逐步降批重试（最多2次降批）
-    """
+    """推理执行（带OOM恢复逻辑）"""
     try_sizes = [take_count, max(1, take_count // 2), max(1, take_count // 4)]
     last_err = None
     for sz in try_sizes:
         try:
-            # 裁剪批次量（按当前重试尺寸）
             uttid = batch_uttid[:sz]
             paths = batch_wav_path[:sz]
             with torch.no_grad():  # 禁用梯度计算，减少显存占用
@@ -136,11 +158,10 @@ def run_inference_with_oom_recovery(instance: ModelInstance, batch_uttid, batch_
             if "out of memory" in msg.lower():
                 print(f"[WARN][{instance.name}] CUDA OOM，清空缓存并降批重试（当前batch={sz}）")
                 torch.cuda.empty_cache()
-                time.sleep(0.01)  # 短暂等待缓存清理完成
+                time.sleep(0.01)
                 continue
             else:
-                raise  # 非OOM错误直接抛出
-    # 所有重试失败时抛出最后一次错误
+                raise
     raise last_err if last_err else RuntimeError("未知推理错误")
 
 
@@ -154,11 +175,9 @@ def batch_processor(instance: ModelInstance):
                 qlen = len(instance.queue)
                 if qlen >= instance.batch_size:
                     break  # 满批触发
-                # 计算剩余等待时间（未超时且队列非空则继续等）
                 remaining = instance.batch_timeout - (time.time() - start_wait)
                 if qlen > 0 and remaining <= 0:
                     break  # 超时触发（有任务时）
-                # 队列空则等待通知，否则等待剩余时间
                 timeout = remaining if qlen > 0 else instance.batch_timeout
                 instance.cond.wait(timeout=timeout)
 
@@ -193,7 +212,6 @@ def batch_processor(instance: ModelInstance):
         results = None
         try:
             infer_start = time.time()
-            # 提取批次内的关键信息
             batch_uttid = [req.request_id for req in current_batch]
             batch_wav_path = [req.temp_path for req in current_batch]
             config = current_batch[0].config  # 同批次使用相同配置
@@ -207,13 +225,12 @@ def batch_processor(instance: ModelInstance):
                 take_count=len(current_batch),
             )
 
-            # 计算推理耗时并映射结果到每个请求
+            # 映射结果并唤醒请求
             infer_duration = time.time() - infer_start
             print(f"[INFO][{instance.name}] 批处理完成，耗时{infer_duration:.3f}秒，batch={len(current_batch)}")
             for i, req in enumerate(current_batch):
                 res = safe_results_index(results, i)
                 total_process_time = time.time() - req.start_time
-                # 填充结果（保留语音时长用于展示）
                 req.result = {
                     "filename": req.filename,
                     "results": res,
@@ -224,13 +241,12 @@ def batch_processor(instance: ModelInstance):
                     "queue_type": instance.name,
                     "audio_duration": f"{req.audio_duration:.2f}秒",
                 }
-                req.event.set()  # 唤醒等待的请求
+                req.event.set()
                 print(f"[DEBUG][{instance.name}] 任务{req.request_id}完成，总耗时{total_process_time:.3f}秒")
 
         except Exception as e:
             error_msg = str(e)
             print(f"[ERROR][{instance.name}] 批处理出错：{error_msg}")
-            # 错误时给每个请求填充错误信息
             for req in current_batch:
                 req.result = {
                     "error": error_msg,
@@ -240,7 +256,7 @@ def batch_processor(instance: ModelInstance):
                 }
                 req.event.set()
         finally:
-            # 清理临时文件（防止磁盘占用）
+            # 清理临时文件
             for req in current_batch:
                 try:
                     if os.path.exists(req.temp_path):
@@ -248,11 +264,11 @@ def batch_processor(instance: ModelInstance):
                 except Exception as e:
                     print(f"[WARN][{instance.name}] 清理临时文件失败: {e}")
 
-            # 内存回收（减少内存泄漏风险）
+            # 内存回收
             del current_batch, results
             gc.collect()
 
-            # 周期性显存清理（按配置周期执行）
+            # 周期性显存清理
             instance.batch_counter += 1
             if instance.batch_counter % EMPTY_CACHE_PERIOD == 0:
                 print(f"[DEBUG][{instance.name}] 周期性显存清理（每{EMPTY_CACHE_PERIOD}批）")
@@ -264,18 +280,18 @@ def batch_processor(instance: ModelInstance):
 
 
 def load_model():
-    """加载单个模型实例（替代原双实例加载）"""
+    """加载单个模型实例（使用命令行指定的模型路径）"""
     global asr_instance
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"正在加载模型实例（设备：{device}）...")
+    print(f"正在加载模型实例（设备：{device}，模型路径：{MODEL_PATH}）...")
 
     try:
-        # 初始化单模型实例（沿用原短语音实例配置，可根据需求调整）
+        # 初始化单模型实例
         asr_instance = ModelInstance(
             instance_id=0,
             name="single_queue"
         )
-        # 加载模型权重
+        # 加载模型（使用命令行参数指定的路径）
         print(f"加载模型到实例 {asr_instance.instance_id} ({asr_instance.name}) ...")
         asr_instance.model = FireRedAsr.from_pretrained("aed", MODEL_PATH, device=device)
 
@@ -299,29 +315,27 @@ async def single_file_asr(
     config: Optional[ASRRequest] = None
 ):
     """异步接口：所有语音请求统一进入单队列处理"""
-    # 检查模型是否加载完成
     if not asr_instance:
         raise HTTPException(status_code=503, detail="模型未加载完成，服务暂不可用")
 
-    request_id = str(uuid.uuid4())  # 生成唯一请求ID
-    config = config or ASRRequest()  # 默认配置
+    request_id = str(uuid.uuid4())
+    config = config or ASRRequest()
     start_time = time.time()
-    temp_path = None  # 临时文件路径
+    temp_path = None
 
     try:
-        # 1. 保存上传文件到临时目录（.wav格式）
+        # 1. 保存上传文件到临时目录
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
             temp_path = f.name
-            f.write(await audio_file.read())  # 异步读取上传文件
+            f.write(await audio_file.read())
 
-        # 2. 计算语音时长（仅用于结果返回，不影响队列）
+        # 2. 计算语音时长
         audio_duration = get_audio_duration(temp_path)
 
-        # 3. 队列容量检查（防止队列溢出）
+        # 3. 队列容量检查
         with asr_instance.lock:
             current_queue_len = len(asr_instance.queue)
         if current_queue_len >= asr_instance.max_queue_size:
-            # 队列满时清理临时文件并返回错误
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
             return JSONResponse(
@@ -333,14 +347,14 @@ async def single_file_asr(
                 status_code=503,
             )
 
-        # 4. 构造请求对象并加入队列
-        event = asyncio.Event()  # 用于异步等待结果
+        # 4. 构造请求并加入队列
+        event = asyncio.Event()
         enqueue_time = time.time()
         batch_req = BatchRequest(
             request_id=request_id,
             filename=audio_file.filename,
             temp_path=temp_path,
-            config=config.model_dump(),  # 转换为字典格式
+            config=config.model_dump(),
             result={},
             event=event,
             start_time=start_time,
@@ -353,18 +367,17 @@ async def single_file_asr(
             asr_instance.queue.append(batch_req)
             new_queue_len = len(asr_instance.queue)
             print(f"[DEBUG] 请求{request_id}入队（语音时长：{audio_duration:.2f}秒，队列长度：{new_queue_len}）")
-            asr_instance.cond.notify()  # 唤醒等待的批处理线程
+            asr_instance.cond.notify()
 
-        # 5. 等待结果（超时时间：60秒，可根据需求调整）
-        timeout = 60  # 单个请求超时时间
+        # 5. 异步等待结果（超时60秒）
+        timeout = 60
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            # 超时后从队列中移除该请求（防止僵尸任务）
+            # 超时移除任务
             with asr_instance.cond:
                 asr_instance.queue = [req for req in asr_instance.queue if req.request_id != request_id]
-                asr_instance.cond.notify_all()  # 重新唤醒线程处理剩余任务
-            # 清理临时文件
+                asr_instance.cond.notify_all()
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
             return JSONResponse(
@@ -376,14 +389,14 @@ async def single_file_asr(
                 status_code=504,
             )
 
-        # 6. 返回处理结果（成功/失败）
+        # 6. 返回结果
         if batch_req.result.get("status") == "success":
             return batch_req.result
         else:
             return JSONResponse(content=batch_req.result, status_code=500)
 
     except Exception as e:
-        # 异常兜底：清理临时文件并返回错误
+        # 异常兜底清理
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
         error_msg = str(e)
@@ -396,30 +409,37 @@ async def single_file_asr(
 
 @app.get("/healthz")
 def health_check():
-    """服务健康检查接口（返回队列状态）"""
+    """服务健康检查接口（返回当前配置和队列状态）"""
     if not asr_instance:
         return JSONResponse(content={"status": "not_ready", "reason": "模型未加载"}, status_code=503)
     return {
         "status": "ok",
-        "queue_length": len(asr_instance.queue),  # 当前队列长度
-        "max_queue_size": asr_instance.max_queue_size,  # 队列最大容量
-        "instance_name": asr_instance.name,  # 实例名称
-        "batch_size": asr_instance.batch_size  # 批处理尺寸
+        "current_config": {
+            "model_path": MODEL_PATH,
+            "service_port": args.port,
+            "service_host": args.host,
+            "batch_size": asr_instance.batch_size,
+            "max_queue_size": asr_instance.max_queue_size
+        },
+        "queue_status": {
+            "current_length": len(asr_instance.queue),
+            "instance_name": asr_instance.name
+        }
     }
 
 
 if __name__ == '__main__':
-    # 1. 加载模型（启动服务前必须完成）
+    # 1. 加载模型（使用命令行指定的路径）
     load_model()
 
-    # 2. 启动FastAPI服务（单进程，避免多进程模型重复加载）
+    # 2. 启动FastAPI服务（使用命令行指定的主机和端口）
     import uvicorn
-    print("启动单队列ASR服务...")
+    print(f"启动单队列ASR服务...\n监听地址：{args.host}:{args.port}\n模型路径：{MODEL_PATH}")
     uvicorn.run(
         app,
-        host='0.0.0.0',  # 允许外部访问
-        port=8023,        # 服务端口（可根据需求调整）
-        workers=1,        # 单进程：避免多进程导致模型重复加载和显存溢出
-        reload=False,     # 生产环境禁用自动重载
-        timeout_keep_alive=120  # 连接保持超时
+        host=args.host,       # 命令行指定的主机（默认0.0.0.0）
+        port=args.port,       # 命令行指定的端口（默认8023）
+        workers=1,            # 单进程：避免多进程模型重复加载
+        reload=False,         # 生产环境禁用自动重载
+        timeout_keep_alive=120
     )
