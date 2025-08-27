@@ -34,7 +34,7 @@ source venv/bin/activate
 ```
 ### 3.安装依赖
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt --no-build-isolation
 ```
 ### 4.在线推理api(测试推理速度)
 ```bash
