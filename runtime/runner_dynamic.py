@@ -168,16 +168,19 @@ class TokenRunner:
             active_items = [(sid, r) for sid, r in self._active.items()
                             if (not r.finished) and (r.step < r.max_len)]
             if not active_items:
-                if self._queue.empty() and not self._staged:
-                    self._work_event.clear()
+                # 纯事件驱动；无积压则无限等，有积压给极短窗口
+                backlog = self._queue.qsize() + len(self._staged)
+                self._work_event.clear()
+                if backlog == 0:
+                    await self._work_event.wait()
+                else:
+                    win = min(0.005, 0.002 * max(1, backlog))  # 2~8ms 自适应窗口
                     try:
-                        await asyncio.wait_for(self._work_event.wait(), timeout=0.01)
+                        await asyncio.wait_for(self._work_event.wait(), timeout=win)
                     except asyncio.TimeoutError:
                         pass
-                if tick_sleep > 0:
-                    await asyncio.sleep(tick_sleep)
-                else:
-                    await asyncio.sleep(0)
+                # 只让出一次调度即可，别再固定 tick
+                await asyncio.sleep(0)
                 continue
 
             # —— 关键：按 sid 排序，保证 0..B-1 的连续前缀，Stepper 才能走 get_block_layer 快路径 —— #
@@ -260,10 +263,7 @@ class TokenRunner:
                 self._active.pop(sid, None)
                 req.sid = None  # 标记该请求不再占槽
 
-            if tick_sleep > 0:
-                await asyncio.sleep(tick_sleep)
-            else:
-                await asyncio.sleep(0)
+            await asyncio.sleep(0)
 
     async def _drain_new_reqs(self):
         n_can_take = self.max_active - (len(self._active) + len(self._staged))
