@@ -1,39 +1,39 @@
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
-
 import torch
-
+import time
 
 @dataclass
 class EncState:
-    """编码器状态数据类，存储编码过程中的关键信息"""
     enc_k: Optional[torch.Tensor] = None
     enc_v: Optional[torch.Tensor] = None
     cu_seqlens: Optional[torch.Tensor] = None
     extra: Dict[str, Any] = field(default_factory=dict)
 
-
 @dataclass
 class DecodeRequest:
-    """解码请求数据类，包含单个解码任务的所有信息"""
     req_id: int
     bos_id: int
     eos_id: int
     max_len: int
     enc: EncState
     meta: Dict[str, Any] = field(default_factory=dict)
-    sid: Optional[int] = None  # 槽位ID
-    tokens: List[int] = field(default_factory=list)  # 已生成的token列表
-    finished: bool = False  # 是否完成解码
-    step: int = 0  # 当前解码步数
-    future: asyncio.Future = field(default_factory=asyncio.Future)  # 用于异步结果返回
-
+    sid: Optional[int] = None
+    tokens: List[int] = field(default_factory=list)
+    finished: bool = False
+    step: int = 0
+    future: asyncio.Future = field(default_factory=asyncio.Future)
 
 class TokenRunner:
     """
-    令牌级动态批处理运行器，负责管理解码请求队列、分配资源并协调解码过程
-    支持连续批处理和KV缓存管理
+    令牌级动态批处理运行器
+    修复点：
+      - 释放顺序：先 pop 再 free，再修补移动行
+      - 规范化 KV.free 返回
+      - 多完成降序释放
+      - 容量计算排除 finished
+      - 一致性自检 + 幽灵清理（开发期可关）
     """
     def __init__(
         self,
@@ -54,16 +54,12 @@ class TokenRunner:
     ):
         self.kv = kv
         self.step_fn = step_fn
-        
-        # 设备配置
         self.device = (
-            device 
-            or getattr(getattr(kv, "spec", None), "device", None) 
-            or getattr(kv, "device", None) 
+            device
+            or getattr(getattr(kv, "spec", None), "device", None)
+            or getattr(kv, "device", None)
             or ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        
-        # 解码参数
         self.bos_id = bos_id
         self.eos_id = eos_id
         self.max_active = max_active or getattr(getattr(kv, "spec", None), "slots", 1024)
@@ -71,25 +67,24 @@ class TokenRunner:
         self.join_new_on_next_step = join_new_on_next_step
         self.sample_fn = sample_fn
         self.on_finish = on_finish
-        
-        # 运行状态管理
+
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        self._req_id_gen = 0  # 请求ID生成器
-        self._queue: "asyncio.Queue[DecodeRequest]" = asyncio.Queue()  # 请求队列
-        self._active: Dict[int, DecodeRequest] = {}  # 活跃请求 {sid: 请求}
-        self._sid2req: Dict[int, DecodeRequest] = {}  # 槽位ID到请求的映射
-        self._staged: List[DecodeRequest] = []  # 待处理的请求
-        self._work_event = asyncio.Event()  # 工作事件触发器
-        
-        # KV缓存管理器接口适配
+        self._req_id_gen = 0
+        self._queue: "asyncio.Queue[DecodeRequest]" = asyncio.Queue()
+        self._active: Dict[int, DecodeRequest] = {}
+        self._sid2req: Dict[int, DecodeRequest] = {}
+        self._staged: List[DecodeRequest] = []
+        self._work_event = asyncio.Event()
+
         self._fn_alloc = self._pick(["alloc", "allocate", "acquire_slot"])
         self._fn_free = self._pick(["free", "release", "free_slot"])
         self._fn_get_batch = self._pick(["get_batch_fixedcap", "get_batch", "gather_fixedcap", "gather_batch"])
-        self._fn_append_batch = lambda *a, **k: None  # Stepper已处理KV写入
+        self._fn_append_batch = lambda *a, **k: None
+
+        self._invariant_check = True  # 开发期可设为 False 关闭一致性检查
 
     def _pick(self, names: List[str]) -> Callable:
-        """从KV管理器中选择可用的接口方法"""
         for name in names:
             method = getattr(self.kv, name, None)
             if callable(method):
@@ -103,9 +98,9 @@ class TokenRunner:
         max_len: int,
         bos_id: Optional[int] = None,
         eos_id: Optional[int] = None,
-        sid: Optional[int] = None,** meta
+        sid: Optional[int] = None,
+        **meta
     ) -> asyncio.Future:
-        """提交新的解码请求并返回Future对象用于获取结果"""
         self._req_id_gen += 1
         req = DecodeRequest(
             req_id=self._req_id_gen,
@@ -115,140 +110,170 @@ class TokenRunner:
             enc=enc,
             meta=meta,
         )
-        
         if sid is not None:
             req.sid = sid
-            
         await self._queue.put(req)
         self._work_event.set()
         return req.future
 
     def start(self):
-        """启动运行器的主循环"""
         if self._running:
             return
         self._running = True
         self._task = asyncio.create_task(self._main_loop())
 
     async def stop(self):
-        """停止运行器并清理资源"""
         self._running = False
         if self._task:
             await self._task
             self._task = None
 
+    # --------- 规范化 free() 返回 ---------
+    @staticmethod
+    def _normalize_moved(freed_sid: int, moved) -> Optional[Tuple[int, int]]:
+        """
+        归一化为 (moved_sid, dst_sid=freed_sid)。
+        支持 (moved, dst) 或 (dst, moved)；None/False 视为无移动。
+        """
+        if not moved:
+            return None
+        try:
+            a, b = moved
+        except Exception:
+            return None
+        if a == freed_sid and b != freed_sid:
+            return (b, freed_sid)   # (dst, moved) -> (moved, dst)
+        if b == freed_sid and a != freed_sid:
+            return (a, freed_sid)   # (moved, dst)
+        # 其它返回形态不可信，忽略修补
+        return None
+
     def _free_slot_and_patch_sid(self, freed_sid: int):
         """
-        释放指定槽位并处理KV缓存中的交换修复
-        如果最后一行被交换到释放的槽位，更新相关请求的映射关系
+        原子释放 + 修补：
+          1) 先把 freed_sid 从 _active/_sid2req 移除
+          2) 调 KV.free(freed_sid)
+          3) 若有移动，把 moved_sid 的请求修正到 dst_sid=freed_sid
         """
-        # 移除完成请求的映射
+        # 1) 先移除“完成的旧行”，避免误删搬来的
+        self._active.pop(freed_sid, None)
         self._sid2req.pop(freed_sid, None)
-        
-        # 释放槽位并获取可能的交换信息
-        moved = self._fn_free(freed_sid)
-        
-        # 处理交换情况：原最后一行被移动到释放的槽位
-        if moved is not None:
-            try:
-                moved_sid, dst_sid = moved
-            except Exception:
-                # 兼容直接返回元组的情况
-                moved_sid, dst_sid = moved[0], moved[1]
-                
-            # 更新被移动请求的槽位ID和映射关系
-            moved_req = self._sid2req.pop(moved_sid, None)
-            if moved_req is not None:
-                moved_req.sid = dst_sid
-                self._sid2req[dst_sid] = moved_req
-                
-                # 同步活跃请求字典
-                if moved_sid in self._active:
-                    self._active.pop(moved_sid, None)
-                    self._active[dst_sid] = moved_req
+
+        # 2) 调 free，可能触发行交换（尾部补洞）
+        moved_raw = self._fn_free(freed_sid)
+        norm = self._normalize_moved(freed_sid, moved_raw)
+        if not norm:
+            return
+        moved_sid, dst_sid = norm  # dst_sid 必为 freed_sid
+
+        # 3) 修补 moved -> dst
+        moved_req = self._sid2req.pop(moved_sid, None)
+        if moved_req is not None:
+            if moved_sid in self._active:
+                self._active.pop(moved_sid, None)
+            moved_req.sid = dst_sid
+            self._sid2req[dst_sid] = moved_req
+            self._active[dst_sid] = moved_req
+
+    def _check_invariants(self):
+        """开发期：轻量一致性检查 + finished 幽灵清理"""
+        if not self._invariant_check:
+            return
+        for sid, r in list(self._active.items()):
+            if r.sid != sid:
+                print(f"[runner][WARN] active-key/sid mismatch: key={sid}, req.sid={r.sid}, req_id={r.req_id}")
+        dangling = set(self._active.keys()) - set(self._sid2req.keys())
+        if dangling:
+            print(f"[runner][WARN] active keys not all in sid2req: {sorted(dangling)}")
+        # 清理 finished 幽灵占位
+        if any(r.finished for r in self._active.values()):
+            self._active = {sid: r for sid, r in self._active.items() if not r.finished}
 
     async def _main_loop(self):
-        """运行器主循环，处理请求队列和批处理解码"""
         tick_sleep = (1.0 / self.loop_hz) if self.loop_hz > 0 else 0.0
-        
+
         while self._running:
-            # 处理新请求
+            # 1) 吸收新请求
             await self._drain_new_reqs()
-            
-            # 为待处理请求分配槽位
+
+            # 2) 分配槽位（把 staged 推入 active）
             if self._staged:
+                try:
+                    qsz = self._queue.qsize()
+                except Exception:
+                    qsz = -1
+                print(f"[runner] staged_before={len(self._staged)} active={len(self._active)} "
+                      f"queue={qsz} slots_max={self.max_active}")
+
                 new_list: List[DecodeRequest] = []
-                for req in self._staged:
+                for req in list(self._staged):
                     if req.sid is None:
                         try:
-                            req.sid = self._fn_alloc()
-                        except Exception:
-                            # 没有可用槽位，留到下一轮处理
+                            sid = self._fn_alloc()
+                            req.sid = sid
+                            print(f"[runner] alloc sid={sid} for req={req.req_id} "
+                                  f"(file={req.meta.get('filename','?')})")
+                        except Exception as e:
+                            print(f"[runner] NO SLOT for req={req.req_id} "
+                                  f"staged={len(self._staged)} active={len(self._active)} "
+                                  f"err={type(e).__name__}:{e}")
                             continue
-                    
                     self._active[req.sid] = req
                     self._sid2req[req.sid] = req
                     new_list.append(req)
-                
-                # 保留未成功分配的请求
+
                 self._staged = [req for req in self._staged if req not in new_list]
-            
-            # 获取仍活跃的请求
+                print(f"[runner] staged_after={len(self._staged)} active={len(self._active)} "
+                      f"newly_activated={len(new_list)}")
+
+            # 3) 组 batch（只挑未完成）
             active_items = [
-                (sid, req) 
-                for sid, req in self._active.items() 
-                if not req.finished and req.step < req.max_len
+                (sid, req)
+                for sid, req in self._active.items()
+                if (not req.finished) and req.step < req.max_len
             ]
-            
-            # 没有活跃请求时的处理逻辑
+
             if not active_items:
                 backlog = self._queue.qsize() + len(self._staged)
                 self._work_event.clear()
-                
                 if backlog == 0:
-                    # 无积压请求，等待新请求
                     await self._work_event.wait()
                 else:
-                    # 有积压请求，使用自适应等待窗口
                     win = min(0.005, 0.002 * max(1, backlog))
                     try:
                         await asyncio.wait_for(self._work_event.wait(), timeout=win)
                     except asyncio.TimeoutError:
                         pass
-                
                 await asyncio.sleep(0)
                 continue
-            
-            # 按槽位ID排序，确保连续前缀以优化性能
+
+            # 4) 排序执行一步
             active_items.sort(key=lambda x: x[0])
             sids_list = [sid for sid, _ in active_items]
             batch_reqs = [req for _, req in active_items]
-            batch_size = len(batch_reqs)
-            
-            # 准备槽位ID张量
+            print(f"[runner] STEP start sids={sids_list} reqs={[r.req_id for r in batch_reqs]} "
+                  f"steps={[r.step for r in batch_reqs]}")
+            t0 = time.perf_counter()
+
             sids = torch.tensor(sids_list, device=self.device, dtype=torch.long)
-            
-            # 获取KV缓存批次数据
             try:
                 K, V, L = self._fn_get_batch(sids)
             except TypeError:
-                # 兼容需要layer_idx参数的实现
                 K = torch.empty(0, device=self.device)
                 V = torch.empty(0, device=self.device)
                 L = torch.empty(0, device=self.device, dtype=torch.int32)
-            
-            # 准备上一步的token（首次使用BOS）
+
             y_prev = torch.tensor(
                 [(req.tokens[-1] if req.tokens else req.bos_id) for req in batch_reqs],
-                device=self.device,
-                dtype=torch.long
+                device=self.device, dtype=torch.long
             )
-            
-            # 执行解码步骤
+
             try:
                 logits, k_t, v_t = self.step_fn(y_prev, batch_reqs, K, V, L)
+                t1 = time.perf_counter()
+                print(f"[runner] STEP done dt={(t1 - t0)*1000:.1f}ms")
             except Exception as e:
-                # 处理解码错误：标记所有请求为完成并返回异常
+                # 本步失败：给本轮 active 设置异常并释放
                 for sid, req in active_items:
                     if not req.future.done():
                         req.future.set_exception(e)
@@ -257,91 +282,72 @@ class TokenRunner:
                         self._free_slot_and_patch_sid(sid)
                     except Exception:
                         pass
-                
-                # 清理活跃请求
-                for sid, _ in active_items:
-                    self._active.pop(sid, None)
-                
+                # 下一轮继续
+                self._work_event.set()
                 continue
-            
-            # 采样生成下一个token
+
+            # 5) 采样 + 终止判定
             next_tokens = self.sample_fn(logits) if self.sample_fn else torch.argmax(logits, dim=-1)
-            
-            # 处理生成的token并检查终止条件
             next_list = next_tokens.tolist()
+
             finished_sids: List[int] = []
-            
             for i, req in enumerate(batch_reqs):
                 tok = int(next_list[i])
+                print(f"[runner] tok req={req.req_id} step={req.step+1} tok={tok} eos={tok==req.eos_id}")
                 req.step += 1
-                
-                # 检查是否到达终止条件
                 if tok == req.eos_id:
                     req.finished = True
                     finished_sids.append(int(sids_list[i]))
                 else:
                     req.tokens.append(tok)
-                    # 检查是否达到最大长度
                     if req.step >= req.max_len:
                         req.finished = True
                         finished_sids.append(int(sids_list[i]))
-            
-            # 处理完成的请求
-            for sid in finished_sids:
+
+            # 6) 按 sid 降序释放，减少交换互扰
+            for sid in sorted(finished_sids, reverse=True):
                 req = self._active.get(sid)
                 if req is None:
                     continue
-                
-                # 返回结果
                 if not req.future.done():
-                    req.future.set_result({
-                        "req_id": req.req_id,
-                        "tokens": req.tokens,
-                        "meta": req.meta
-                    })
-                
-                # 调用完成回调
+                    req.future.set_result({"req_id": req.req_id, "tokens": req.tokens, "meta": req.meta})
                 if self.on_finish is not None:
                     try:
                         self.on_finish(req)
                     except Exception:
                         pass
-                
-                # 释放槽位并处理交换
                 try:
+                    print(f"[runner] FIN req={req.req_id} sid={sid} len={len(req.tokens)}")
                     self._free_slot_and_patch_sid(sid)
+                    print(f"[runner] ACTIVE after free: {list(self._active.keys())}")
                 except Exception:
                     pass
-                
-                # 从活跃请求中移除
-                self._active.pop(sid, None)
-                req.sid = None  # 标记不再占用槽位
-            
+                # 不要再额外 pop(sid)，上面已处理
+                print(f"[runner] ACTIVE after pop({sid}): {list(self._active.keys())}")
+                req.sid = None
+
+            # 7) 开发期一致性检查 + 小让步
+            self._check_invariants()
             await asyncio.sleep(0)
 
     async def _drain_new_reqs(self):
         """从请求队列中获取新请求并进行初步处理"""
-        # 计算可接收的新请求数量
-        n_can_take = self.max_active - (len(self._active) + len(self._staged))
+        # 只统计未完成活跃项，防止幽灵占位导致容量为负
+        live_active = sum(1 for r in self._active.values() if not r.finished)
+        n_can_take = self.max_active - (live_active + len(self._staged))
         taken = 0
-        
+
         while taken < n_can_take and not self._queue.empty():
             req: DecodeRequest = await self._queue.get()
-            
             if not self.join_new_on_next_step:
-                # 立即分配槽位
                 if req.sid is None:
                     try:
                         req.sid = self._fn_alloc()
                     except Exception:
-                        # 分配失败，放回队列
                         await self._queue.put(req)
                         break
-                
                 self._active[req.sid] = req
                 self._sid2req[req.sid] = req
             else:
-                # 暂存到下一批处理
                 self._staged.append(req)
-            
             taken += 1
